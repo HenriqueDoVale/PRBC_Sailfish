@@ -30,16 +30,28 @@ Rust workspace (`Cargo.toml` → `shared`, `sparse_bullshark`). One binary,
 | `sparse_bullshark/src/consensus/dag.rs` | `DAG` / `PRBCDag` — vertex store, round index, pruning |
 | `sparse_bullshark/src/types/vertex.rs` | `Vertex` (with `weak_edges`), `TimeoutCertificate`, `NoVoteCertificate` |
 | `sparse_bullshark/src/network/prbc_message.rs` | PRBC wire messages (Batch / Propose / Vote / Recovery / RecoveryResp / Timeout) |
-| `shared/` | Environment loading, key management, transaction generator, VRF |
-| `run_linux.py` | **Local** multi-process run; median CONFIG+RESULTS block. Reads `shared/nodes.csv` |
-| `run_distributed.py` | **GCP cluster** run of our binary over SSH. Reads `shared/nodes_distributed.csv` |
-| `run_cluster.py` | Hasan's 1760-line SSH/GCP deploy+run for our binary (alt to `run_distributed.py`) |
-| `bench.py` | Batch driver: edit `EXPERIMENTS`, calls `run_linux.py`, prints comparison table |
-| `setup_cluster.sh` | One-time: generate `nodes_distributed.csv`, scp binary+keys+config to every VM |
+| `shared/` | Environment loading, key management, transaction generator, VRF. The binary reads `./shared/nodes.csv` + `./shared/public_keys.toml` from the CWD, so it runs from the repo root |
+| `scripts/local/run_linux.py` | **Local** multi-process run; median CONFIG+RESULTS block. Reads `shared/nodes.csv` |
+| `scripts/local/bench.py` | Batch driver: edit `EXPERIMENTS`, calls `run_linux.py`, prints comparison table |
+| `scripts/local/run_sparse.ps1` | Old Windows launcher (one PowerShell window per node) |
+| `scripts/cluster/run_distributed.py` | **GCP cluster** run of our binary over SSH. Reads `shared/nodes_distributed.csv` |
+| `scripts/cluster/run_cluster.py` | Hasan's 1760-line SSH/GCP deploy+run for our binary (alt to `run_distributed.py`) |
+| `scripts/cluster/setup_cluster.sh` | One-time: generate `nodes_distributed.csv`, scp binary+keys+config to every VM |
+| `scripts/cluster/setup_keys.sh` | Source it to export `PRIVATE_KEY_i` from `keys` |
+| `scripts/cluster/monitor_cluster.py` | Machine-level CPU/NIC sampler (see Resource measurement) |
+| `scripts/plots/` | `plot_figure_d.py` (Figure D), `notebooks_Plot.ipynb` |
+| `thesis_writing/` | The writing pack — the **only** copy of every thesis doc (EVALUATION_RESULTS, PSEUDOCODE, CORRECTNESS_OUTLINE, THESIS_CONTEXT, OBJECTIVE*/PRBC_C/RECOVERY_TESTING). Edit them here |
+| `docs/` | Not for the writing pack: `RUNBOOK.md`, `RESULTS_INVENTORY.md` (audit trail), `THIS_WEEKS_WORK.md` |
+| `keys` | Node private keys, **not in git** (`.gitignore`). Kept locally and on the cluster; the README says to ask the author |
+
+Every script switches to the repo root itself (`os.chdir` / `cd`), so it works
+from any directory; `monitor_cluster.py` is the exception (it reads no repo
+files, so `--hosts-file` stays relative to where you start it). Layout
+reorganised 25 Nov 2026; before that all scripts and docs sat at the root.
 
 > **Name collision:** the Narwhal baseline has its *own* `run_cluster.py` at
 > `~/sailfish/benchmark/run_cluster.py` on node-0 (nibeshrestha/sailfish repo).
-> Unrelated to this repo's `run_cluster.py`. See Testing → Narwhal below.
+> Unrelated to this repo's `scripts/cluster/run_cluster.py`. See Testing → Narwhal below.
 
 ## Architecture essentials
 
@@ -66,11 +78,46 @@ hash-committed vertices) → `try_committing_prbc` (leader witnessed by 2f+1 in
 r+1) → `commit_causal_history_prbc` (traverses **strong + weak** edges) →
 `on_execution_ready` once the payload is verified.
 
+**Correctness fixes (27 Oct, after the recovery rewrite).** Votes sign
+`(round, source, hash)`; the source signs its vertex (`PRBCPropose.signature`),
+checked with votes on the reader tasks (`verify_signatures`). Vote rule
+(`check_parents`): vote only when every parent is certified locally, ≥2f+1
+strong edges from distinct sources, weak edges within `gc_depth`, and a leader
+skipping the previous leader carries a no-vote certificate (`NoVote` messages
+→ NVC, Sailfish). Missing parents → `CertRequest`/`Certificate`. Commit rule =
+Sailfish walk-back from the latest directly committed leader, skipping leaders
+with no strong path (`Leaders skipped`); `history_complete` blocks ordering
+with a gap; histories ordered by (round, source). Before this, one `silent`
+node stopped ordering forever. Test fault `byz5` = byz1 + votes to 2f+1 peers
+(forces certificate fetch). Quorum is **n − f** (28 Oct; was 2f+1, which is
+unsafe when n ≠ 3f+1, e.g. n=20/30/50). 29 Oct: a process that certifies a
+slot before it votes still votes once the vote rule holds (validity, Lemma
+4.6; counter `Votes post-quorum`); a vertex fetched by recovery is unsigned
+and never voted for. Local checks: `docs/RESULTS_INVENTORY.md` §17, §17.4.
+
+**Batching (28 Oct, supervisor's request).** `make_batch` builds the batch
+when the party proposes: transactions always available, count = load since
+the last batch (cap `--n-tx`, excess carried), unique (source, seq) tag. Rounds
+run at protocol speed; batch size follows the round rate. All PRBC latency
+results before 28 Oct used paced batches and must be re-measured
+(`docs/RESULTS_INVENTORY.md` §18).
+
 **Payload lag ≠ error.** A digest-vote quorum (Control plane, tiny) routinely
 completes before the 256KB payload finishes on the Dissemination plane. That arms
-`start_recovery`, but `tick_recovery` only sends a `PRBCRecovery` after
-`RECOVERY_TIMEOUT_MS` (500ms) and `on_execution_ready` cancels it the instant the
-propose/batch lands — the common case. Stats counters:
+`start_recovery`; `on_execution_ready` cancels it the instant the propose/batch
+lands — the common case. A missing *vertex* is requested on the next 50 ms tick;
+a missing *batch* (vertex parked in `pending_on_batch`) only after
+`RECOVERY_TIMEOUT_MS`.
+
+**Recovery (rewritten 27 Oct).** Asks the quorum's voters one at a time: first
+`PRBCRecovery` for the vertex, then `BatchRequest` for its batch by digest
+(answered with `BatchResp`, never relayed). Requester checks hash/digest itself,
+so responders need no vote quorum. After a full pass with no valid answer it
+restarts with doubling wait (cap 8× `RECOVERY_TIMEOUT_MS`); dropped only when the
+round leaves the retention window. Executed batches / pruned vertices are kept
+`RETENTION_ROUNDS` (default 50) rounds in `RetentionStore`s, so `Batches cached`
+still means "not yet executed". Test faults: `byz3` (batch to only 2f+1 peers),
+`byz4` (never answers recovery). See `thesis_writing/PSEUDOCODE.md` Figure 6. Stats counters:
 `Payload-lag events` (quorum before local payload) ≈ `Payload post-quorum`
 (propose then arrived on its own), while `Network recoveries` / `Recovery resp OK`
 (actual wire fetches) stay near zero. High lag count with ~zero network
@@ -99,10 +146,13 @@ is the "inline signed vote" variant used in the WAN experiment.
 | `RBC_MODE` | `signed_vote` or `bracha` (sailfish only) |
 | `MEMPOOL_MODE` | `decoupled` → digest-carrying vertices |
 | `PRBC_SIGS` | `off` disables Ed25519 vote sigs (prbc only; default on) |
-| `REDUCED_QUORUM` | `on` → f+1 instead of 2f+1 (**CFT, not BFT-safe** — experiments only) |
+| `REDUCED_QUORUM` | `on` → f+1 instead of n−f (**CFT, not BFT-safe** — experiments only) |
 | `ROUND_TIMEOUT_MS` | round timeout, default 500 |
-| `RECOVERY_TIMEOUT_MS` | Phase-3 recovery retry timeout |
+| `RECOVERY_TIMEOUT_MS` | Phase-3 recovery retry timeout (also the wait before the first batch request) |
+| `RETENTION_ROUNDS` | PRBC only — rounds an executed batch / pruned vertex is kept for peers' recovery, default 50, 0 = off. `run_distributed.py --retention-rounds` |
 | `NETWORK_MBPS` / `CONSENSUS_NETWORK_PERCENT` | dissemination-plane bandwidth pacer |
+| `BATCH_MODE` | PRBC only. Default: batch built at proposal time, size = load since last batch (max `--n-tx`). `paced` = old generator (full batch every n_tx·n/rate; proposals wait) |
+| `MIN_PROPOSAL_GAP_MS` | PRBC only. Minimum time between a party's proposals; sets round rate, batch size (load × gap) and CPU. Rule: n²/25 ms (4/16/36/100 ms at n=10/20/30/50, ~50% CPU). `run_distributed.py --min-gap-ms` |
 | `PRBC_SAMPLE_C` | PRBC only — overrides the `1.4` in `sample_size=ceil(C·√n)` for the S1/S2 relay set. Bigger = more redundancy/network, fewer genuine recoveries |
 
 `EXECUTION_DURATION = 60` (seconds) is a compile-time const in both consensus files.
@@ -113,8 +163,8 @@ is the "inline signed vote" variant used in the WAN experiment.
 
 ```bash
 cargo build --release
-python3 run_linux.py --tx-size 512 --n-tx 500 --mode prbc_sailfish --input-rate 20000
-python3 run_linux.py --tx-size 512 --n-tx 500 --mode sailfish --rbc signed_vote
+python3 scripts/local/run_linux.py --tx-size 512 --n-tx 500 --mode prbc_sailfish --input-rate 20000
+python3 scripts/local/run_linux.py --tx-size 512 --n-tx 500 --mode sailfish --rbc signed_vote
 ```
 
 `run_linux.py` regenerates nothing — it reads `shared/nodes.csv` as-is. `bench.py`
@@ -126,13 +176,13 @@ Output: one `+ CONFIG` / `+ RESULTS` block, **median across nodes**. Key metrics
 
 ### GCP cluster — our binary
 
-10 VMs, internal IPs in `setup_cluster.sh` (`10.164.0.12` is node-0 / the
+10 VMs, internal IPs in `scripts/cluster/setup_cluster.sh` (`10.164.0.12` is node-0 / the
 orchestrator; the other 9 are `.6 .11 .8 .9 .10 .13 .14 .15 .16`). One-time:
-`bash setup_cluster.sh`. Then from `~/Sparse_Bullshark` on node-0:
+`bash scripts/cluster/setup_cluster.sh`. Then from `~/Sparse_Bullshark` on node-0:
 
 ```bash
-python3 run_distributed.py --tx-size 512 --n-tx 500 --mode prbc_sailfish --n-nodes 10 --input-rate 20000
-python3 run_distributed.py --tx-size 512 --n-tx 500 --mode sailfish --rbc signed_vote --n-nodes 10 --input-rate 10000
+python3 scripts/cluster/run_distributed.py --tx-size 512 --n-tx 500 --mode prbc_sailfish --n-nodes 10 --input-rate 20000
+python3 scripts/cluster/run_distributed.py --tx-size 512 --n-tx 500 --mode sailfish --rbc signed_vote --n-nodes 10 --input-rate 10000
 ```
 
 `--n-nodes N` truncates the topology to the first N rows. `--decoupled`,
@@ -183,7 +233,7 @@ baseline, and the one that captures co-located contention (5 node processes +
 workers sharing one machine). Run it in a second terminal:
 
 ```bash
-python3 monitor_cluster.py --hosts-file shared/nodes_distributed.csv --duration 85
+python3 scripts/cluster/monitor_cluster.py --hosts-file shared/nodes_distributed.csv --duration 85
 # then immediately start the benchmark; --trim 5 drops the ramp/teardown edges
 ```
 
